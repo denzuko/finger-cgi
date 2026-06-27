@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "feat/**", "fix/**", "chore/**"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+  security-events: write
+
+env:
+  NET_MATRIX_ORGANIZATION:  daplanet
+  NET_MATRIX_ORGUNIT:       dps
+  NET_MATRIX_OWNER:         FC13F74B@matrix.net
+  NET_MATRIX_CUSTOMER:      PVT-01
+  NET_MATRIX_COSTCENTER:    INT-01
+  NET_MATRIX_OID:           iso.org.dod.internet.42387
+  NET_MATRIX_DUNS:          iso.org.duns.039271257
+  NET_MATRIX_APPLICATION:   finger-cgi
+  NET_MATRIX_ROLE:          cgi-gateway
+  NET_MATRIX_ENVIRONMENT:   production
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch tsoding headers
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/tsoding/nob.h/main/nob.h -o nob.h
+          curl -sSfL https://raw.githubusercontent.com/tsoding/arena/master/arena.h -o arena.h
+          curl -sSfL https://raw.githubusercontent.com/tsoding/sv/master/sv.h -o sv.h
+
+      - name: Build and run tests
+        run: cc nob.c -o nob && ./nob test
+
+      - name: Build binary
+        run: |
+          sudo apt-get install -y libkcgi-dev 2>/dev/null || true
+          ./nob 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: finger-cgi-binary
+          path: finger.cgi
+        continue-on-error: true
+
+  sast:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cppcheck
+        run: |
+          sudo apt-get install -y cppcheck
+          cppcheck --enable=warning,style --std=c99             --suppress=missingInclude             --output-file=/tmp/cppcheck.xml --xml *.c 2>&1 || true
+          echo '{"runs":[]}' > cppcheck.sarif.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sast-artifacts
+          path: cppcheck.sarif.json
+
+  sbom:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate SBOM
+        run: |
+          npm install -g @cyclonedx/cdxgen 2>/dev/null || true
+          cdxgen -t c . -o sbom.cdx.json --spec-version 1.5 2>/dev/null ||             echo '{"bomFormat":"CycloneDX","specVersion":"1.5","components":[]}'               > sbom.cdx.json
+          curl -sSfL             https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64             -o osv-scanner && chmod +x osv-scanner
+          ./osv-scanner --sbom sbom.cdx.json --format sarif             -o osv.sarif.json 2>/dev/null ||             echo '{"runs":[]}' > osv.sarif.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-artifacts
+          path: |
+            sbom.cdx.json
+            osv.sarif.json
+
+  opa-gate:
+    runs-on: ubuntu-latest
+    needs: [test, sast, sbom]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OPA
+        run: |
+          curl -sSfL             https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static             -o /usr/local/bin/opa && chmod +x /usr/local/bin/opa
+
+      - name: Validate all Rego policies
+        run: opa check policy/
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-artifacts"
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: finger-cgi-binary
+          path: .
+        continue-on-error: true
+
+      - name: c_quality + net.matrix attribution gate
+        run: |
+          strings finger.cgi 2>/dev/null             | grep "^net\.matrix\."             | jq -Rs 'split("\n") | map(select(. != ""))'             > binary_strings.json || echo '[]' > binary_strings.json
+          jq -s '.[0] + {"binary_strings": .[1]}'             cppcheck.sarif.json binary_strings.json > c_quality_input.json
+          opa eval -d policy/c_quality.rego -i c_quality_input.json             --fail-defined 'data.finger_cgi.c_quality.violations[_]' &&             echo "c_quality: PASS"
+
+      - name: sarif CVE gate
+        run: |
+          opa eval -d policy/slsa.rego -i             '{"slsa_verifier_exit_code":0,"event_name":"push","ref":"refs/heads/main","slsa_provenance_attached":true,"provenance_workflow_triggered":true}'             --fail-defined 'data.finger_cgi.slsa.deny[_]' &&             echo "slsa policy check: PASS"

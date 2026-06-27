@@ -1,0 +1,109 @@
+name: SLSA Provenance
+
+on:
+  workflow_dispatch:
+  release:
+    types: [created]
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+env:
+  NET_MATRIX_ORGANIZATION:  daplanet
+  NET_MATRIX_ORGUNIT:       dps
+  NET_MATRIX_OWNER:         FC13F74B@matrix.net
+  NET_MATRIX_CUSTOMER:      PVT-01
+  NET_MATRIX_COSTCENTER:    INT-01
+  NET_MATRIX_OID:           iso.org.dod.internet.42387
+  NET_MATRIX_DUNS:          iso.org.duns.039271257
+  NET_MATRIX_APPLICATION:   finger-cgi
+  NET_MATRIX_ROLE:          cgi-gateway
+  NET_MATRIX_ENVIRONMENT:   production
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch tsoding headers
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/tsoding/nob.h/main/nob.h -o nob.h
+          curl -sSfL https://raw.githubusercontent.com/tsoding/arena/master/arena.h -o arena.h
+          curl -sSfL https://raw.githubusercontent.com/tsoding/sv/master/sv.h -o sv.h
+
+      - name: Install deps + build
+        run: |
+          sudo apt-get install -y libkcgi-dev
+          cc nob.c -o nob && ./nob
+
+      - name: Verify net.matrix strings
+        run: |
+          strings finger.cgi | grep "^net\.matrix\." ||             (echo "FAIL: net.matrix strings missing" && exit 1)
+
+      - name: Hash with openssl
+        id: hash
+        run: |
+          openssl dgst -sha256 -hex finger.cgi             | awk '{print $2}' > finger.cgi.sha256
+          echo "hashes=$(base64 -w0 finger.cgi.sha256)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: finger-cgi-release
+          path: |
+            finger.cgi
+            finger.cgi.sha256
+
+  provenance:
+    needs: [build]
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects:  "${{ needs.build.outputs.hashes }}"
+      upload-assets:    true
+      provenance-name:  "finger-cgi.intoto.jsonl"
+
+  verify:
+    needs: [build, provenance]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: finger-cgi-release
+
+      - name: Download provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ github.ref_name }}"             --pattern "finger-cgi.intoto.jsonl"             --repo "${{ github.repository }}"
+
+      - name: Install slsa-verifier
+        run: |
+          curl -sSfL             https://github.com/slsa-framework/slsa-verifier/releases/latest/download/slsa-verifier-linux-amd64             -o slsa-verifier && chmod +x slsa-verifier
+
+      - name: Verify provenance
+        id: verify
+        run: |
+          ./slsa-verifier verify-artifact             finger.cgi             --provenance-path finger-cgi.intoto.jsonl             --source-uri "github.com/${{ github.repository }}"             --source-tag "${{ github.ref_name }}"
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Install OPA + Rego gate
+        run: |
+          curl -sSfL             https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static             -o opa && chmod +x opa
+          echo "{
+            \"slsa_verifier_exit_code\": ${{ steps.verify.outputs.exit_code }},
+            \"event_name\": \"${{ github.event_name }}\",
+            \"ref\": \"${{ github.ref }}\",
+            \"slsa_provenance_attached\": true,
+            \"provenance_workflow_triggered\": true
+          }" > slsa_input.json
+          ./opa eval -d policy/slsa.rego -i slsa_input.json             --fail-defined 'data.finger_cgi.slsa.deny[_]' &&             echo "slsa gate: PASS"
